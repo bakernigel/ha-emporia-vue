@@ -27,7 +27,9 @@
                     "enable_1d": "Energy Today Sensor",
                     "enable_1m": "Power Minute Average Sensor",
                     "enable_1mon": "Energy This Month Sensor",
-                    "solar_invert": "Invert Values for Solar Circuits"
+                    "solar_invert": "Invert Values for Solar Circuits",
+                    "realtime_start_time": "Realtime Mains start time",
+                    "realtime_end_time": "Realtime Mains end time"
                 }
             },
             "user": {

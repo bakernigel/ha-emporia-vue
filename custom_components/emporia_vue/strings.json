@@ -33,7 +33,9 @@
           "enable_1m": "[%key:component::emporia_vue::config::step::email_password::data::enable_1m%]",
           "enable_1d": "[%key:component::emporia_vue::config::step::email_password::data::enable_1d%]",
           "enable_1mon": "[%key:component::emporia_vue::config::step::email_password::data::enable_1mon%]",
-          "solar_invert": "[%key:component::emporia_vue::config::step::email_password::data::solar_invert%]"
+          "solar_invert": "[%key:component::emporia_vue::config::step::email_password::data::solar_invert%]",
+          "realtime_start_time": "Realtime Mains start time",
+          "realtime_end_time": "Realtime Mains end time"
         }
       },
       "reauth_confirm": {

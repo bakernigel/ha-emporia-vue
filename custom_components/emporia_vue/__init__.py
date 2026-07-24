@@ -20,7 +20,7 @@ from pyemvue.device import (
     VueDeviceChannelUsage,
     VueUsageDevice,
 )
-from pyemvue.enums import Scale
+from pyemvue.enums import Scale, Unit
 import requests
 import voluptuous as vol
 
@@ -35,6 +35,7 @@ from homeassistant.exceptions import (
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
     AUTH_METHOD,
@@ -48,6 +49,8 @@ from .const import (
     ENABLE_1D,
     ENABLE_1M,
     ENABLE_1MON,
+    REALTIME_END_TIME,
+    REALTIME_START_TIME,
     SOLAR_INVERT,
     VUE_DATA,
 )
@@ -76,6 +79,14 @@ LAST_DAY_UPDATE: datetime | None = None
 LAST_MONTH_DATA: dict[str, Any] = {}
 LAST_MONTH_UPDATE: datetime | None = None
 INVERT_SOLAR: bool = True
+
+# Realtime Mains polling is intentionally limited to the weekday APS-style
+# peak window to avoid unnecessary load on Emporia's cloud API. The chart
+# endpoint is queried for only the main (1,2,3) channel of each Vue device.
+DEFAULT_REALTIME_START_TIME = "16:00:00"
+DEFAULT_REALTIME_END_TIME = "19:00:00"
+REALTIME_UPDATE_INTERVAL = timedelta(seconds=5)
+REALTIME_REQUEST_WINDOW = timedelta(seconds=10)
 
 
 def redact_config_data(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -230,6 +241,251 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 LAST_MINUTE_DATA = data
             return data
 
+        def _realtime_mains_template() -> dict[str, Any]:
+            """Build coordinator data entries for each Vue Mains channel."""
+            data: dict[str, Any] = {}
+            for gid, info in DEVICE_INFORMATION.items():
+                # Emporia represents the combined mains as channel 1,2,3.
+                # Prefer that stable channel identifier over the display name.
+                mains_channel = next(
+                    (channel for channel in info.channels if channel.channel_num == "1,2,3"),
+                    None,
+                )
+                if mains_channel is None:
+                    continue
+                identifier = make_channel_id(mains_channel, Scale.SECOND.value)
+                data[identifier] = {
+                    "device_gid": gid,
+                    "channel_num": mains_channel.channel_num,
+                    "usage": None,
+                    "scale": Scale.SECOND.value,
+                    "info": info,
+                    "reset": None,
+                    "timestamp": None,
+                    "hour_energy": 0.0,
+                    "hour_average_kw": 0.0,
+                    "hour_start": None,
+                    "hour_sample_count": 0,
+                    "last_completed_hour_energy": 0.0,
+                    "last_completed_hour_start": None,
+                    "peak_demand_today_kw": 0.0,
+                    "peak_demand_hour_start": None,
+                }
+            return data
+
+        realtime_last_data: dict[str, Any] = _realtime_mains_template()
+        realtime_failure_count = 0
+        realtime_backoff_until: datetime | None = None
+        # Per-channel accumulation state for the current clock hour.  We request
+        # overlapping 1-second chart windows, so timestamps are used to ensure
+        # each bucket is counted exactly once.
+        realtime_hour_state: dict[str, dict[str, Any]] = {}
+        # Completed-hour/peak state is kept separately so an hour rollover can
+        # reset the live accumulator without losing the just-finished APS block.
+        realtime_peak_state: dict[str, dict[str, Any]] = {}
+
+        def _parse_realtime_time(value: str, fallback: str):
+            """Parse an HA time selector value, falling back to a known good time."""
+            try:
+                return datetime.strptime(value, "%H:%M:%S").time()
+            except (TypeError, ValueError):
+                try:
+                    return datetime.strptime(value, "%H:%M").time()
+                except (TypeError, ValueError):
+                    return datetime.strptime(fallback, "%H:%M:%S").time()
+
+        def _in_realtime_window(local_now: datetime) -> bool:
+            """Return True when local time is inside the configured weekday window."""
+            if local_now.weekday() >= 5:
+                return False
+
+            start_time = _parse_realtime_time(
+                entry.data.get(REALTIME_START_TIME, DEFAULT_REALTIME_START_TIME),
+                DEFAULT_REALTIME_START_TIME,
+            )
+            end_time = _parse_realtime_time(
+                entry.data.get(REALTIME_END_TIME, DEFAULT_REALTIME_END_TIME),
+                DEFAULT_REALTIME_END_TIME,
+            )
+            current_time = local_now.time().replace(tzinfo=None)
+
+            # Normal same-day window, for example 16:00-19:00. Also support
+            # an overnight test window such as 23:00-01:00.
+            if start_time < end_time:
+                return start_time <= current_time < end_time
+            if start_time > end_time:
+                return current_time >= start_time or current_time < end_time
+            return False
+
+        async def async_update_realtime_mains() -> dict[str, Any]:
+            """Fetch 1-second Mains data during the configured weekday window."""
+            nonlocal realtime_last_data, realtime_failure_count, realtime_backoff_until
+
+            local_now = dt_util.now()
+            # Do not contact Emporia outside the configured peak window. Keep
+            # the entities present, but report no realtime value.
+            if not _in_realtime_window(local_now):
+                realtime_failure_count = 0
+                realtime_backoff_until = None
+                realtime_last_data = _realtime_mains_template()
+                return realtime_last_data
+
+            utcnow = datetime.now(UTC)
+            if realtime_backoff_until and utcnow < realtime_backoff_until:
+                return realtime_last_data
+
+            updated = _realtime_mains_template()
+            try:
+                for identifier, item in updated.items():
+                    info: VueDevice = item["info"]
+                    channel_num: str = item["channel_num"]
+                    channel = next(
+                        (
+                            candidate
+                            for candidate in info.channels
+                            if candidate.channel_num == channel_num
+                        ),
+                        None,
+                    )
+                    if channel is None:
+                        continue
+
+                    # Reset the accumulator at the top of each local clock hour.
+                    local_hour_start = local_now.replace(
+                        minute=0, second=0, microsecond=0
+                    )
+                    hour_start_utc = local_hour_start.astimezone(UTC)
+                    state = realtime_hour_state.get(identifier)
+                    peak_state = realtime_peak_state.get(identifier)
+                    if peak_state is None or peak_state.get("local_date") != local_now.date():
+                        peak_state = {
+                            "local_date": local_now.date(),
+                            "last_completed_hour_energy": 0.0,
+                            "last_completed_hour_start": None,
+                            "peak_demand_today_kw": 0.0,
+                            "peak_demand_hour_start": None,
+                        }
+                        realtime_peak_state[identifier] = peak_state
+
+                    if state is None or state["hour_start"] != hour_start_utc:
+                        # Finalize the previous clock hour before starting the new
+                        # one. A complete one-hour block's kWh is numerically equal
+                        # to its average kW demand.
+                        if state is not None and state.get("hour_start") is not None:
+                            completed_energy = float(state.get("energy", 0.0))
+                            completed_start = state["hour_start"]
+                            peak_state["last_completed_hour_energy"] = completed_energy
+                            peak_state["last_completed_hour_start"] = completed_start
+                            if completed_energy > peak_state["peak_demand_today_kw"]:
+                                peak_state["peak_demand_today_kw"] = completed_energy
+                                peak_state["peak_demand_hour_start"] = completed_start
+
+                        state = {
+                            "hour_start": hour_start_utc,
+                            "energy": 0.0,
+                            "last_timestamp": None,
+                            "sample_count": 0,
+                        }
+                        realtime_hour_state[identifier] = state
+
+                    # Preserve the latest valid realtime sample through the brief
+                    # cloud delay that can occur exactly at a clock-hour rollover.
+                    previous_item = realtime_last_data.get(identifier, {})
+                    if previous_item.get("usage") is not None:
+                        item["usage"] = previous_item.get("usage")
+                        item["timestamp"] = previous_item.get("timestamp")
+
+                    # Normally query a short rolling window. After the first
+                    # successful bucket, start at the next unprocessed second so
+                    # temporary failures/backoff do not create gaps.
+                    if state["last_timestamp"] is not None:
+                        start = state["last_timestamp"] + timedelta(seconds=1)
+                        # Keep a small overlap to tolerate timestamp rounding and
+                        # delayed cloud buckets; duplicate timestamps are ignored.
+                        start -= timedelta(seconds=2)
+                    else:
+                        # On first entry (or after an HA restart), catch up from
+                        # the top of the clock hour so the APS hour-energy and
+                        # average-demand sensors are immediately meaningful.
+                        start = hour_start_utc
+                    if start < hour_start_utc:
+                        start = hour_start_utc
+
+                    usage_list, first_usage_instant = await hass.async_add_executor_job(
+                        partial(
+                            vue.get_chart_usage,
+                            channel,
+                            start,
+                            utcnow,
+                            scale=Scale.SECOND.value,
+                            unit=Unit.KWH.value,
+                        )
+                    )
+
+                    # Process every returned 1-second bucket.  Requests overlap by
+                    # design, therefore only timestamps newer than the last bucket
+                    # already accumulated are added to the current-hour energy.
+                    latest_timestamp = None
+                    latest_usage = None
+                    for index, usage in enumerate(usage_list):
+                        if usage is None:
+                            continue
+                        timestamp = first_usage_instant + timedelta(seconds=index)
+                        if timestamp < hour_start_utc:
+                            continue
+                        latest_timestamp = timestamp
+                        latest_usage = usage
+                        if (
+                            state["last_timestamp"] is None
+                            or timestamp > state["last_timestamp"]
+                        ):
+                            state["energy"] += float(usage)
+                            state["last_timestamp"] = timestamp
+                            state["sample_count"] += 1
+
+                    if latest_timestamp is not None:
+                        item["usage"] = latest_usage
+                        item["timestamp"] = latest_timestamp
+
+                    item["hour_energy"] = state["energy"]
+                    item["hour_start"] = hour_start_utc
+                    item["hour_sample_count"] = state["sample_count"]
+                    item["hour_average_kw"] = 0.0
+                    if state["last_timestamp"] is not None:
+                        elapsed_seconds = (
+                            state["last_timestamp"] - hour_start_utc
+                        ).total_seconds() + 1
+                        if elapsed_seconds > 0:
+                            item["hour_average_kw"] = (
+                                state["energy"] * 3600.0 / elapsed_seconds
+                            )
+
+                    item["last_completed_hour_energy"] = peak_state[
+                        "last_completed_hour_energy"
+                    ]
+                    item["last_completed_hour_start"] = peak_state[
+                        "last_completed_hour_start"
+                    ]
+                    item["peak_demand_today_kw"] = peak_state["peak_demand_today_kw"]
+                    item["peak_demand_hour_start"] = peak_state[
+                        "peak_demand_hour_start"
+                    ]
+
+                realtime_failure_count = 0
+                realtime_backoff_until = None
+                realtime_last_data = updated
+                return updated
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                realtime_failure_count += 1
+                backoff_seconds = min(60, 5 * (2 ** (realtime_failure_count - 1)))
+                realtime_backoff_until = utcnow + timedelta(seconds=backoff_seconds)
+                _LOGGER.warning(
+                    "Realtime Mains update failed; backing off for %s seconds: %s",
+                    backoff_seconds,
+                    err,
+                )
+                return realtime_last_data
+
         async def async_update_day_sensors() -> dict:
             global LAST_DAY_UPDATE
             global LAST_DAY_DATA
@@ -315,6 +571,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             await coordinator_1min.async_config_entry_first_refresh()
             _LOGGER.debug("1min Update data: %s", coordinator_1min.data)
+        coordinator_realtime_mains = DataUpdateCoordinator(
+            hass,
+            _LOGGER,
+            name="realtime_mains",
+            update_method=async_update_realtime_mains,
+            update_interval=REALTIME_UPDATE_INTERVAL,
+        )
+        await coordinator_realtime_mains.async_config_entry_first_refresh()
+        _LOGGER.debug(
+            "Realtime Mains initial data: %s", coordinator_realtime_mains.data
+        )
+
         coordinator_1mon = None
         if ENABLE_1MON not in entry_data or entry_data[ENABLE_1MON]:
             coordinator_1mon = DataUpdateCoordinator(
@@ -493,6 +761,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = {
         VUE_DATA: vue,
         "coordinator_1min": coordinator_1min,
+        "coordinator_realtime_mains": coordinator_realtime_mains,
         "coordinator_1mon": coordinator_1mon,
         "coordinator_day_sensor": coordinator_day_sensor,
         "coordinator_device_status": coordinator_device_status,

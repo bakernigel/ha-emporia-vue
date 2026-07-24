@@ -31,6 +31,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up the sensor platform."""
     coordinator_1min = hass.data[DOMAIN][config_entry.entry_id]["coordinator_1min"]
+    coordinator_realtime_mains = hass.data[DOMAIN][config_entry.entry_id].get(
+        "coordinator_realtime_mains"
+    )
     coordinator_1mon = hass.data[DOMAIN][config_entry.entry_id]["coordinator_1mon"]
     coordinator_day_sensor = hass.data[DOMAIN][config_entry.entry_id][
         "coordinator_day_sensor"
@@ -42,6 +45,32 @@ async def async_setup_entry(
         async_add_entities(
             CurrentVuePowerSensor(coordinator_1min, identifier)
             for _, identifier in enumerate(coordinator_1min.data)
+        )
+
+    if coordinator_realtime_mains:
+        async_add_entities(
+            CurrentVuePowerSensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
+        )
+        async_add_entities(
+            RealtimeVueEnergySampleSensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
+        )
+        async_add_entities(
+            RealtimeVueHourEnergySensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
+        )
+        async_add_entities(
+            RealtimeVueHourAverageDemandSensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
+        )
+        async_add_entities(
+            RealtimeVueLastCompletedHourEnergySensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
+        )
+        async_add_entities(
+            RealtimeVuePeakDemandTodaySensor(coordinator_realtime_mains, identifier)
+            for _, identifier in enumerate(coordinator_realtime_mains.data)
         )
 
     if coordinator_1mon:
@@ -180,11 +209,274 @@ class CurrentVuePowerSensor(CoordinatorEntity, SensorEntity):  # type: ignore
         """Return a human readable scale."""
         if self._scale == Scale.MINUTE.value:
             return "Minute Average"
+        if self._scale == Scale.SECOND.value:
+            return "Realtime"
         if self._scale == Scale.DAY.value:
             return "Today"
         if self._scale == Scale.MONTH.value:
             return "This Month"
         return self._scale
+
+
+class RealtimeVueEnergySampleSensor(CoordinatorEntity, SensorEntity):  # type: ignore
+    """Latest raw one-second Mains energy sample returned by Emporia."""
+
+    def __init__(self, coordinator, identifier) -> None:
+        """Initialize the raw realtime energy sample sensor."""
+        super().__init__(coordinator)
+        self._id = identifier
+        device_gid: int = coordinator.data[identifier]["device_gid"]
+        channel_num: str = coordinator.data[identifier]["channel_num"]
+        self._device: VueDevice = coordinator.data[identifier]["info"]
+        final_channel = next(
+            (
+                channel
+                for channel in self._device.channels
+                if channel.channel_num == channel_num
+            ),
+            None,
+        )
+        if final_channel is None:
+            raise RuntimeError(
+                f"No channel found for device_gid {device_gid} and channel_num {channel_num}"
+            )
+        self._channel: VueDeviceChannel = final_channel
+
+        self._attr_has_entity_name = True
+        self._attr_name = "Energy Realtime 1s Sample"
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        # This is an interval/delta sample, not a cumulative meter reading.
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_suggested_display_precision = 6
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return the device info."""
+        device_name = self._channel.name or self._device.device_name
+        return DeviceInfo(
+            identifiers={
+                (DOMAIN, f"{self._device.device_gid}-{self._channel.channel_num}")
+            },
+            name=device_name,
+            model=self._device.model,
+            sw_version=self._device.firmware,
+            manufacturer="Emporia",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the raw kWh used in the latest one-second bucket."""
+        if self._id not in self.coordinator.data:
+            return None
+        return self.coordinator.data[self._id]["usage"]
+
+    @property
+    def unique_id(self) -> str:
+        """Return a unique ID distinct from the realtime power sensor."""
+        return (
+            "sensor.emporia_vue.realtime_energy_sample."
+            f"{self._channel.device_gid}-{self._channel.channel_num}"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str] | None:
+        """Expose the timestamp of the one-second bucket."""
+        if self._id not in self.coordinator.data:
+            return None
+        timestamp = self.coordinator.data[self._id].get("timestamp")
+        if timestamp is None:
+            return None
+        return {"sample_timestamp": timestamp.isoformat()}
+
+
+class RealtimeVueHourEnergySensor(CoordinatorEntity, SensorEntity):  # type: ignore
+    """Energy accumulated from unique 1-second Mains buckets this clock hour."""
+
+    def __init__(self, coordinator, identifier) -> None:
+        super().__init__(coordinator)
+        self._id = identifier
+        self._device: VueDevice = coordinator.data[identifier]["info"]
+        channel_num = coordinator.data[identifier]["channel_num"]
+        self._channel = next(
+            channel for channel in self._device.channels if channel.channel_num == channel_num
+        )
+        self._attr_has_entity_name = True
+        self._attr_name = "APS Current Hour Energy"
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        self._attr_state_class = SensorStateClass.TOTAL
+        self._attr_suggested_display_precision = 4
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self._device.device_gid}-{self._channel.channel_num}")},
+            name=self._channel.name or self._device.device_name,
+            model=self._device.model,
+            sw_version=self._device.firmware,
+            manufacturer="Emporia",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        if self._id not in self.coordinator.data:
+            return None
+        return self.coordinator.data[self._id].get("hour_energy")
+
+    @property
+    def unique_id(self) -> str:
+        return (
+            "sensor.emporia_vue.aps_current_hour_energy."
+            f"{self._channel.device_gid}-{self._channel.channel_num}"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object] | None:
+        if self._id not in self.coordinator.data:
+            return None
+        data = self.coordinator.data[self._id]
+        hour_start = data.get("hour_start")
+        return {
+            "hour_start": hour_start.isoformat() if hour_start else None,
+            "sample_count": data.get("hour_sample_count", 0),
+        }
+
+
+class RealtimeVueHourAverageDemandSensor(CoordinatorEntity, SensorEntity):  # type: ignore
+    """Average kW demand so far in the current clock hour."""
+
+    def __init__(self, coordinator, identifier) -> None:
+        super().__init__(coordinator)
+        self._id = identifier
+        self._device: VueDevice = coordinator.data[identifier]["info"]
+        channel_num = coordinator.data[identifier]["channel_num"]
+        self._channel = next(
+            channel for channel in self._device.channels if channel.channel_num == channel_num
+        )
+        self._attr_has_entity_name = True
+        self._attr_name = "APS Current Hour Average Demand"
+        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+        self._attr_device_class = SensorDeviceClass.POWER
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_suggested_display_precision = 3
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self._device.device_gid}-{self._channel.channel_num}")},
+            name=self._channel.name or self._device.device_name,
+            model=self._device.model,
+            sw_version=self._device.firmware,
+            manufacturer="Emporia",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        if self._id not in self.coordinator.data:
+            return None
+        return self.coordinator.data[self._id].get("hour_average_kw")
+
+    @property
+    def unique_id(self) -> str:
+        return (
+            "sensor.emporia_vue.aps_current_hour_average_demand."
+            f"{self._channel.device_gid}-{self._channel.channel_num}"
+        )
+
+
+class RealtimeVueLastCompletedHourEnergySensor(CoordinatorEntity, SensorEntity):  # type: ignore
+    """Energy used in the most recently completed realtime clock-hour block."""
+
+    def __init__(self, coordinator, identifier) -> None:
+        super().__init__(coordinator)
+        self._id = identifier
+        self._device: VueDevice = coordinator.data[identifier]["info"]
+        channel_num = coordinator.data[identifier]["channel_num"]
+        self._channel = next(
+            channel for channel in self._device.channels if channel.channel_num == channel_num
+        )
+        self._attr_has_entity_name = True
+        self._attr_name = "APS Last Completed Hour Energy"
+        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_suggested_display_precision = 4
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self._device.device_gid}-{self._channel.channel_num}")},
+            name=self._channel.name or self._device.device_name,
+            model=self._device.model,
+            sw_version=self._device.firmware,
+            manufacturer="Emporia",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        if self._id not in self.coordinator.data:
+            return None
+        return self.coordinator.data[self._id].get("last_completed_hour_energy", 0.0)
+
+    @property
+    def unique_id(self) -> str:
+        return (
+            "sensor.emporia_vue.aps_last_completed_hour_energy."
+            f"{self._channel.device_gid}-{self._channel.channel_num}"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        start = self.coordinator.data[self._id].get("last_completed_hour_start")
+        return {"hour_start": start.isoformat() if start else None}
+
+
+class RealtimeVuePeakDemandTodaySensor(CoordinatorEntity, SensorEntity):  # type: ignore
+    """Highest completed one-hour demand block observed today."""
+
+    def __init__(self, coordinator, identifier) -> None:
+        super().__init__(coordinator)
+        self._id = identifier
+        self._device: VueDevice = coordinator.data[identifier]["info"]
+        channel_num = coordinator.data[identifier]["channel_num"]
+        self._channel = next(
+            channel for channel in self._device.channels if channel.channel_num == channel_num
+        )
+        self._attr_has_entity_name = True
+        self._attr_name = "APS Peak Demand Today"
+        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+        self._attr_device_class = SensorDeviceClass.POWER
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_suggested_display_precision = 3
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self._device.device_gid}-{self._channel.channel_num}")},
+            name=self._channel.name or self._device.device_name,
+            model=self._device.model,
+            sw_version=self._device.firmware,
+            manufacturer="Emporia",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        if self._id not in self.coordinator.data:
+            return None
+        return self.coordinator.data[self._id].get("peak_demand_today_kw", 0.0)
+
+    @property
+    def unique_id(self) -> str:
+        return (
+            "sensor.emporia_vue.aps_peak_demand_today."
+            f"{self._channel.device_gid}-{self._channel.channel_num}"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        start = self.coordinator.data[self._id].get("peak_demand_hour_start")
+        return {"peak_hour_start": start.isoformat() if start else None}
 
 
 # Known Emporia charger API responses (from historical data):

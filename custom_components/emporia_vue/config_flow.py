@@ -12,6 +12,7 @@ import voluptuous as vol
 from homeassistant import config_entries, exceptions
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import selector
 
 from .const import (
     AUTH_METHOD,
@@ -28,6 +29,8 @@ from .const import (
     ENABLE_1D,
     ENABLE_1M,
     ENABLE_1MON,
+    REALTIME_END_TIME,
+    REALTIME_START_TIME,
     SOLAR_INVERT,
     TOKEN_CONFIG_FLOW_SCHEMA,
 )
@@ -244,6 +247,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ENABLE_1D: user_input[ENABLE_1D],
                 ENABLE_1MON: user_input[ENABLE_1MON],
                 SOLAR_INVERT: user_input[SOLAR_INVERT],
+                REALTIME_START_TIME: user_input[REALTIME_START_TIME],
+                REALTIME_END_TIME: user_input[REALTIME_END_TIME],
                 CUSTOMER_GID: info[CUSTOMER_GID],
                 CONFIG_TITLE: info[CONFIG_TITLE],
             }
@@ -269,6 +274,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 SOLAR_INVERT,
                 default=current_config.data.get(SOLAR_INVERT, True),
             ): cv.boolean,
+            vol.Optional(
+                REALTIME_START_TIME,
+                default=current_config.data.get(REALTIME_START_TIME, "16:00:00"),
+            ): selector.TimeSelector(),
+            vol.Optional(
+                REALTIME_END_TIME,
+                default=current_config.data.get(REALTIME_END_TIME, "19:00:00"),
+            ): selector.TimeSelector(),
         }
 
         return self.async_show_form(

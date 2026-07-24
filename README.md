@@ -55,3 +55,24 @@ If you are unable to set a password, the integration also supports token-based a
 2. Open your browser's Developer Tools (F12) and go to the **Application** tab (Chrome/Edge) or **Storage** tab (Firefox).
 3. Under **IndexedDB** → **com.amplify.awsCognitoAuthPlugin** → **default.store**, look for keys ending in `.hostedUi.idToken`, `.hostedUi.accessToken`, and `.hostedUi.refreshToken` - copy the values of all three, making sure to only keep the values within the quotes (should start with `eyJ` or similar)
 4. Use those values in the token authentication step of the integration setup.
+
+### Realtime Mains test build (0.12.3)
+
+This test build adds a separate **Power Realtime** sensor for each Vue device's
+combined Mains (`1,2,3`) channel. It uses PyEmVue `get_chart_usage()` with
+1-second source data, but requests only the Mains channel every 5 seconds and
+only on weekdays from 16:00 through 18:59 in Home Assistant's local timezone.
+Outside that window the realtime sensor remains present but has no value. The
+existing minute/day/month coordinators are unchanged. Realtime API errors use
+exponential backoff up to 60 seconds.
+
+
+## Realtime Mains test sensor
+
+This test build adds a Mains-only realtime power sensor using Emporia 1-second chart data.
+The API is polled every 5 seconds only on weekdays and only inside a configurable local-time window.
+Use Home Assistant **Settings → Devices & services → Emporia Vue → Reconfigure** to set the **Realtime Mains start time** and **Realtime Mains end time**. Defaults are 16:00 and 19:00.
+
+
+### Realtime Mains test additions (0.12.6)
+Adds a Mains-only realtime power sensor plus a raw `Energy Realtime 1s Sample` sensor in kWh. The latter is the latest one-second energy bucket returned by Emporia and includes a `sample_timestamp` attribute.

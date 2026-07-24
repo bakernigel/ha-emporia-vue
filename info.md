@@ -7,3 +7,7 @@ After installation, enable the integration in the Home Assistant integration con
 This project is still a work in progress and may have bugs or missing features. Please make an [issue on github](https://github.com/magico13/ha-emporia-vue/issues) if you encounter any issues!
 
 Note: This project is not associated with or endorsed by Emporia Energy.
+
+
+### Realtime Mains test additions (0.12.6)
+Adds a Mains-only realtime power sensor plus a raw `Energy Realtime 1s Sample` sensor in kWh. The latter is the latest one-second energy bucket returned by Emporia and includes a `sample_timestamp` attribute.
