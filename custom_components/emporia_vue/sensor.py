@@ -247,7 +247,9 @@ class RealtimeVueEnergySampleSensor(CoordinatorEntity, SensorEntity):  # type: i
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_device_class = SensorDeviceClass.ENERGY
         # This is an interval/delta sample, not a cumulative meter reading.
-        self._attr_state_class = SensorStateClass.MEASUREMENT
+        # Do not assign an energy state class, because Home Assistant only permits
+        # TOTAL or TOTAL_INCREASING for sensors with the ENERGY device class.
+        self._attr_state_class = None
         self._attr_suggested_display_precision = 6
 
     @property
@@ -400,7 +402,9 @@ class RealtimeVueLastCompletedHourEnergySensor(CoordinatorEntity, SensorEntity):
         self._attr_name = "APS Last Completed Hour Energy"
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_device_class = SensorDeviceClass.ENERGY
-        self._attr_state_class = SensorStateClass.MEASUREMENT
+        # Each completed hour is a total for that discrete hour and may be lower
+        # than the preceding hour, so TOTAL is correct rather than TOTAL_INCREASING.
+        self._attr_state_class = SensorStateClass.TOTAL
         self._attr_suggested_display_precision = 4
 
     @property

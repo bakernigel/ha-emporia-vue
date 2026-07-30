@@ -14,5 +14,5 @@
     "boto3==1.37.1"
   ],
   "single_config_entry": true,
-  "version": "0.12.8"
+  "version": "0.14.0"
 }

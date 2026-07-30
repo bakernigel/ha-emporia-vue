@@ -317,20 +317,96 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return current_time >= start_time or current_time < end_time
             return False
 
+        def _finalize_elapsed_realtime_hours(local_now: datetime) -> None:
+            """Finalize any accumulator whose local clock hour has ended.
+
+            This runs before the realtime-window check so the final APS hour is
+            saved even when the polling window ends at the same clock boundary.
+            Hour rollover bookkeeping therefore does not depend on an API grace
+            period or on another realtime chart request succeeding after 19:00.
+            """
+            current_hour_start_local = local_now.replace(
+                minute=0, second=0, microsecond=0
+            )
+            current_hour_start_utc = current_hour_start_local.astimezone(UTC)
+
+            for identifier, state in realtime_hour_state.items():
+                completed_start = state.get("hour_start")
+                if completed_start is None or completed_start >= current_hour_start_utc:
+                    continue
+
+                completed_local_date = completed_start.astimezone(
+                    local_now.tzinfo
+                ).date()
+                if completed_local_date != local_now.date():
+                    continue
+
+                peak_state = realtime_peak_state.get(identifier)
+                if peak_state is None or peak_state.get("local_date") != local_now.date():
+                    peak_state = {
+                        "local_date": local_now.date(),
+                        "last_completed_hour_energy": 0.0,
+                        "last_completed_hour_start": None,
+                        "peak_demand_today_kw": 0.0,
+                        "peak_demand_hour_start": None,
+                    }
+                    realtime_peak_state[identifier] = peak_state
+
+                completed_energy = float(state.get("energy", 0.0))
+                peak_state["last_completed_hour_energy"] = completed_energy
+                peak_state["last_completed_hour_start"] = completed_start
+                if completed_energy > peak_state["peak_demand_today_kw"]:
+                    peak_state["peak_demand_today_kw"] = completed_energy
+                    peak_state["peak_demand_hour_start"] = completed_start
+
+        def _inactive_realtime_data(local_now: datetime) -> dict[str, Any]:
+            """Return inactive entities while retaining completed-hour APS state."""
+            data = _realtime_mains_template()
+            for identifier, item in data.items():
+                peak_state = realtime_peak_state.get(identifier)
+                if peak_state is None or peak_state.get("local_date") != local_now.date():
+                    peak_state = {
+                        "local_date": local_now.date(),
+                        "last_completed_hour_energy": 0.0,
+                        "last_completed_hour_start": None,
+                        "peak_demand_today_kw": 0.0,
+                        "peak_demand_hour_start": None,
+                    }
+                    realtime_peak_state[identifier] = peak_state
+
+                item["last_completed_hour_energy"] = peak_state[
+                    "last_completed_hour_energy"
+                ]
+                item["last_completed_hour_start"] = peak_state[
+                    "last_completed_hour_start"
+                ]
+                item["peak_demand_today_kw"] = peak_state["peak_demand_today_kw"]
+                item["peak_demand_hour_start"] = peak_state[
+                    "peak_demand_hour_start"
+                ]
+            return data
+
         async def async_update_realtime_mains() -> dict[str, Any]:
             """Fetch 1-second Mains data during the configured weekday window."""
             nonlocal realtime_last_data, realtime_failure_count, realtime_backoff_until
 
             local_now = dt_util.now()
-            # Do not contact Emporia outside the configured peak window. Keep
-            # the entities present, but report no realtime value.
-            if not _in_realtime_window(local_now):
+
+            # Finalize a completed local clock hour before deciding whether the
+            # realtime API should still be polled. This is especially important
+            # at the configured end boundary (for example 19:00), where the live
+            # polling window closes at the exact moment the final APS block ends.
+            _finalize_elapsed_realtime_hours(local_now)
+
+            in_realtime_window = _in_realtime_window(local_now)
+            if not in_realtime_window:
                 realtime_failure_count = 0
                 realtime_backoff_until = None
-                realtime_last_data = _realtime_mains_template()
+                realtime_last_data = _inactive_realtime_data(local_now)
                 return realtime_last_data
 
             utcnow = datetime.now(UTC)
+            query_end_utc = utcnow
             if realtime_backoff_until and utcnow < realtime_backoff_until:
                 return realtime_last_data
 
@@ -374,11 +450,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         if state is not None and state.get("hour_start") is not None:
                             completed_energy = float(state.get("energy", 0.0))
                             completed_start = state["hour_start"]
-                            peak_state["last_completed_hour_energy"] = completed_energy
-                            peak_state["last_completed_hour_start"] = completed_start
-                            if completed_energy > peak_state["peak_demand_today_kw"]:
-                                peak_state["peak_demand_today_kw"] = completed_energy
-                                peak_state["peak_demand_hour_start"] = completed_start
+                            completed_local_date = completed_start.astimezone(
+                                local_now.tzinfo
+                            ).date()
+                            # Do not carry yesterday's final accumulator into a
+                            # new day's peak when realtime polling starts again.
+                            if completed_local_date == local_now.date():
+                                peak_state["last_completed_hour_energy"] = completed_energy
+                                peak_state["last_completed_hour_start"] = completed_start
+                                if completed_energy > peak_state["peak_demand_today_kw"]:
+                                    peak_state["peak_demand_today_kw"] = completed_energy
+                                    peak_state["peak_demand_hour_start"] = completed_start
 
                         state = {
                             "hour_start": hour_start_utc,
@@ -416,7 +498,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             vue.get_chart_usage,
                             channel,
                             start,
-                            utcnow,
+                            query_end_utc,
                             scale=Scale.SECOND.value,
                             unit=Unit.KWH.value,
                         )
